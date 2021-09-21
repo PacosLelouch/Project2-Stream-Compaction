@@ -151,6 +151,22 @@ void testMain() {
     //printArray(SIZE, c, true);//
     printCmpResult(NPOT, b, c);
     /////////////////////////////////////////
+    
+    zeroArray(SIZE, c);
+    printDesc("work-efficient-h-2pass scan, power-of-two");
+    StreamCompaction::Efficient::scanBatchTwoPassPerBlock(SIZE, c, a, false);
+    printElapsedTime(StreamCompaction::Efficient::timer().getGpuElapsedTimeForPreviousOperation(), "(CUDA Measured)");
+    printArray(SIZE, c, true);//
+    printCmpResult(SIZE, b, c);
+
+    zeroArray(SIZE, c);
+    printDesc("work-efficient-h-2pass scan, non-power-of-two");
+    StreamCompaction::Efficient::scanBatchTwoPassPerBlock(NPOT, c, a, false);
+    printElapsedTime(StreamCompaction::Efficient::timer().getGpuElapsedTimeForPreviousOperation(), "(CUDA Measured)");
+    //printArray(SIZE, c, true);//
+    printCmpResult(NPOT, b, c);
+
+    /////////////////////////////////////////
 
     printf("\n");
     printf("****************************************\n");

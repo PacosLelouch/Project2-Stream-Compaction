@@ -452,6 +452,207 @@ namespace StreamCompaction {
             cudaFree(cuda_g_odata);
         }
 
+        //////////////////// Try to scan by two pass
+            
+        __global__ void kernInclusiveScanWorkEfficientInBlockUpSweep(int n, int* odata) {
+            extern __shared__ int sharedMemory[];
+            int bkDim = blockDim.x;
+            int dblBkDim = blockDim.x << 1;
+            int tid = threadIdx.x;
+            int bid = blockIdx.x;
+            unsigned int loopLimit = (n > dblBkDim) ? dblBkDim : n;
+            unsigned int halfLoopLimit = loopLimit >> 1;
+
+            int indexBaseInBlock = bid * dblBkDim;
+            int localIdx = ((tid + 1) << 1) - 1;
+
+            int totalIdx = indexBaseInBlock + localIdx;
+            if (totalIdx >= n) {
+                return;
+            }
+            int* s_odata = sharedMemory;
+            //int* s_idata = sharedMemory + dblBkDim;
+
+            int localIdxToRead = tid;
+            int localIdxToRead2 = tid + halfLoopLimit;
+
+            // Bank conflict?
+            s_odata[localIdxToRead] = odata[indexBaseInBlock + localIdxToRead];
+            s_odata[localIdxToRead2] = odata[indexBaseInBlock + localIdxToRead2];
+            //s_idata[localIdxToRead] = s_odata[localIdxToRead];
+            //s_idata[localIdxToRead2] = s_odata[localIdxToRead2];
+            //__syncthreads();
+
+            unsigned int stride = 2;
+            // Up sweep. It is not necessary to calculate the rightmost sum
+            //for (; stride <= loopLimit; stride <<= 1) {
+            for (; stride < loopLimit; stride <<= 1) {
+                localIdx = tid * stride + (stride - 1);
+                __syncthreads();
+                if (localIdx < loopLimit) {
+                    int leftLocalIdx = tid * stride + ((stride - 1) >> 1);
+                    s_odata[localIdx] += s_odata[leftLocalIdx];
+
+                    // Write back early
+                    odata[indexBaseInBlock + leftLocalIdx] = s_odata[leftLocalIdx];
+                }
+                else {
+                    return;
+                }
+            }
+            //printf("tid:%d, stride:%d\n", tid, stride);
+
+            // Write back
+            //odata[indexBaseInBlock + localIdxToRead] = s_odata[localIdxToRead];
+            //odata[indexBaseInBlock + localIdxToRead2] = s_odata[localIdxToRead2];
+            odata[indexBaseInBlock + localIdx] = s_odata[localIdx];
+        }
+
+        __global__ void kernInclusiveScanWorkEfficientInBlockDownSweep(int n, int* odata, const int* idata) {
+            extern __shared__ int sharedMemory[];
+            int bkDim = blockDim.x;
+            int dblBkDim = blockDim.x << 1;
+            int tid = threadIdx.x;
+            int bid = blockIdx.x;
+            unsigned int loopLimit = (n > dblBkDim) ? dblBkDim : n;
+            unsigned int halfLoopLimit = loopLimit >> 1;
+
+            int indexBaseInBlock = bid * dblBkDim;
+            int localIdx = ((tid + 1) << 1) - 1;
+
+            int totalIdx = indexBaseInBlock + localIdx;
+            if (totalIdx >= n) {
+                return;
+            }
+            int* s_odata = sharedMemory;
+            //int* s_idata = sharedMemory + dblBkDim;
+
+            int localIdxToRead = tid;
+            int localIdxToRead2 = tid + halfLoopLimit;
+
+            // Bank conflict?
+            s_odata[localIdxToRead] = odata[indexBaseInBlock + localIdxToRead];
+            s_odata[localIdxToRead2] = odata[indexBaseInBlock + localIdxToRead2];
+            //s_idata[localIdxToRead] = s_odata[localIdxToRead];
+            //s_idata[localIdxToRead2] = s_odata[localIdxToRead2];
+            __syncthreads();
+
+
+            unsigned int stride = 2;
+            for (; stride < loopLimit; stride <<= 1);
+            //stride >>= 1; // Because the rightmost sum is not calculated, we don't need to halve the stride
+            if (tid * stride + stride == loopLimit) {
+                s_odata[loopLimit - 1] = 0;
+            }
+
+            // Down sweep
+            for (; stride > 1; stride >>= 1) {
+                localIdx = tid * stride + (stride - 1);
+                __syncthreads();
+                if (localIdx < loopLimit) {
+                    int leftLocalIdx = tid * stride + ((stride - 1) >> 1);
+                    int tmp = s_odata[leftLocalIdx];
+                    s_odata[leftLocalIdx] = s_odata[localIdx];
+                    s_odata[localIdx] += tmp;
+                }
+            }
+
+            // Exclusive to inclusive (Do it in write back)
+            __syncthreads();
+            //s_odata[localIdxToRead] += s_idata[localIdxToRead];
+            //s_odata[localIdxToRead2] += s_idata[localIdxToRead2];
+
+            // Write back
+            odata[indexBaseInBlock + localIdxToRead] = s_odata[localIdxToRead] + idata[indexBaseInBlock + localIdxToRead];
+            odata[indexBaseInBlock + localIdxToRead2] = s_odata[localIdxToRead2] + idata[indexBaseInBlock + localIdxToRead2];
+        }
+
+        inline void inclusiveScanInBlockTwoPassPerBlock(int newN, int* cuda_g_odata, int* cuda_g_idata, int threadsPerBlock = 128, bool wrapPartition = false) {
+            int blockCount = (newN + (threadsPerBlock - 1)) / threadsPerBlock;
+            if (wrapPartition) {
+                //Wrap partition not implemented.
+            }
+            else {
+                cudaMemcpy(cuda_g_odata, cuda_g_idata, sizeof(int) * newN, cudaMemcpyDeviceToDevice);
+                kernInclusiveScanWorkEfficientInBlockUpSweep<<<blockCount, threadsPerBlock>> 1, (threadsPerBlock << 0) * sizeof(int)>>>(newN, cuda_g_odata);
+                kernInclusiveScanWorkEfficientInBlockDownSweep<<<blockCount, threadsPerBlock >> 1, (threadsPerBlock << 0) * sizeof(int)>>>(newN, cuda_g_odata, cuda_g_idata);
+            }
+        }
+
+        void scanGpuBatchTwoPassPerBlock(int newN, int* cuda_g_odata, int* cuda_g_blockSums, int* cuda_g_blockIncrements, int threadsPerBlock = 128,
+                int depth = 0, bool wrapPartition = false) {
+            int batch = (newN + threadsPerBlock - 1) / threadsPerBlock;
+            //printf("N:%d, blockCount:%d, threadsPerBlock:%d, logn:%d\n", newN, batch, threadsPerBlock, logn);//TEST
+            if (batch > 0) {
+                if (batch > 1) {
+                    //if (depth < 2) {
+                    //    int serialBatch = std::max(1, batch / threadsPerBlock);
+                    //    kernInclusiveScanSerialInBlock<<<serialBatch, threadsPerBlock>>>(newN, cuda_g_odata);
+                    //}
+                    //else {
+                    inclusiveScanInBlockTwoPassPerBlock(newN, cuda_g_blockIncrements, cuda_g_odata, threadsPerBlock);
+                    cudaMemcpy(cuda_g_odata, cuda_g_blockIncrements, sizeof(int) * newN, cudaMemcpyDeviceToDevice);
+                    //}
+
+                    int nextNewN = batch;
+                    int nextBatch = (nextNewN + threadsPerBlock - 1) / threadsPerBlock;
+                    //int logThPerBk = ilog2ceil(threadsPerBlock);
+                    kernGenBlockSums<<<nextBatch, threadsPerBlock>>>(nextNewN, cuda_g_blockSums, cuda_g_odata);
+                    scanGpuBatchTwoPassPerBlock(nextNewN, cuda_g_blockSums, cuda_g_blockSums + nextNewN, cuda_g_blockIncrements, threadsPerBlock,
+                        depth + 1, wrapPartition);
+                    //kernGenBlockIncrementsToExclusive<<<batch, threadsPerBlock>>>(newN, cuda_g_blockIncrements, cuda_g_odata, cuda_g_blockSums);
+                    //cudaMemcpy(cuda_g_odata, cuda_g_blockIncrements, sizeof(int) * (newN), cudaMemcpyDeviceToDevice);
+#if WRITE_EXC_WITH_INC
+                    kernGenBlockIncrementsToIncExc<<<batch, threadsPerBlock>>>(newN, cuda_g_blockIncrements, cuda_g_odata, cuda_g_blockSums);
+#else // WRITE_EXC_WITH_INC
+                    kernGenBlockIncrementsToInclusive<<<batch, threadsPerBlock>>>(newN, cuda_g_blockIncrements, cuda_g_odata, cuda_g_blockSums);
+                    cudaMemset(cuda_g_odata, 0, sizeof(int));
+                    cudaMemcpy(cuda_g_odata + 1, cuda_g_blockIncrements, sizeof(int) * (newN - 1), cudaMemcpyDeviceToDevice);
+#endif // WRITE_EXC_WITH_INC
+                }
+                else {
+                    //inclusiveScanInBlock(newN, cuda_g_blockIncrements, threadsPerBlock); // Not correct if in depth > 0
+                    inclusiveScanInBlockTwoPassPerBlock(newN, cuda_g_blockIncrements, cuda_g_odata, threadsPerBlock);
+
+                    //cudaMemcpy(cuda_g_blockIncrements, cuda_g_odata, sizeof(int) * (newN), cudaMemcpyDeviceToDevice);
+                    cudaMemset(cuda_g_odata, 0, sizeof(int));
+                    cudaMemcpy(cuda_g_odata + 1, cuda_g_blockIncrements, sizeof(int) * (newN - 1), cudaMemcpyDeviceToDevice);
+                }
+            }
+        }
+
+        void scanBatchTwoPassPerBlock(int n, int* odata, const int* idata, bool wrapPartition) {
+            int threadsPerBlock = 512;//128;
+
+            int* cuda_g_odata = nullptr;
+            int* cuda_g_blockSums = nullptr;
+            int* cuda_g_blockIncrements = nullptr;
+
+            int logn = ilog2ceil(n);
+            size_t newN = 1i64 << logn;
+            size_t sizeNewN = sizeof(int) * newN;
+            cudaMalloc(&cuda_g_odata, sizeNewN);
+            cudaMalloc(&cuda_g_blockSums, sizeNewN);
+            cudaMalloc(&cuda_g_blockIncrements, sizeNewN);
+            //cudaMemset(cuda_g_odata, 0, sizeNewN);
+            cudaMemset(cuda_g_blockSums, 0, sizeNewN);
+            //cudaMemset(cuda_g_blockIncrements, 0, sizeNewN);
+            cudaMemcpy(cuda_g_odata, idata, sizeof(int) * n, cudaMemcpyHostToDevice);
+            cudaMemcpy(cuda_g_blockIncrements, cuda_g_odata, sizeof(int) * n, cudaMemcpyDeviceToDevice);
+
+            timer().startGpuTimer();
+            // DONE
+            scanGpuBatchTwoPassPerBlock(newN, cuda_g_odata, cuda_g_blockSums, cuda_g_blockIncrements, threadsPerBlock, 0, wrapPartition);
+            timer().endGpuTimer();
+
+            cudaMemcpy(odata, cuda_g_odata, sizeof(int) * n, cudaMemcpyDeviceToHost);
+            cudaDeviceSynchronize();
+
+            cudaFree(cuda_g_blockIncrements);
+            cudaFree(cuda_g_blockSums);
+            cudaFree(cuda_g_odata);
+        }
+
         void compactGpuBatch(int newN, int logn, int* cuda_g_odata, int* cuda_g_bools, int* cuda_g_indices, int* cuda_g_blockSums, int* cuda_g_blockIncrements, 
                 const int* cuda_g_idata, int threadsPerBlock = 128, bool splitOnce = false) {
             int blockCountSimplePara = (newN + (threadsPerBlock - 1)) / threadsPerBlock;

@@ -12,6 +12,8 @@ namespace StreamCompaction {
 
         void scanBatch(int n, int* odata, const int* idata, bool splitOnce = true);
 
+        void scanBatchTwoPassPerBlock(int n, int* odata, const int* idata, bool wrapPartition = false);
+
         int compactBatch(int n, int *odata, const int *idata, bool splitOnce = true);
 
         void sort(int n, int* odata, const int* idata);
