@@ -156,7 +156,7 @@ void testMain() {
     printDesc("work-efficient-h-2pass scan, power-of-two");
     StreamCompaction::Efficient::scanBatchTwoPassPerBlock(SIZE, c, a, false);
     printElapsedTime(StreamCompaction::Efficient::timer().getGpuElapsedTimeForPreviousOperation(), "(CUDA Measured)");
-    printArray(SIZE, c, true);//
+    //printArray(SIZE, c, true);//
     printCmpResult(SIZE, b, c);
 
     zeroArray(SIZE, c);

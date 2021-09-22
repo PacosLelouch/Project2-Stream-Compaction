@@ -484,9 +484,9 @@ namespace StreamCompaction {
             //__syncthreads();
 
             unsigned int stride = 2;
-            // Up sweep. It is not necessary to calculate the rightmost sum
-            //for (; stride <= loopLimit; stride <<= 1) {
-            for (; stride < loopLimit; stride <<= 1) {
+            // Up sweep. It is necessary to calculate the rightmost sum
+            for (; stride <= loopLimit; stride <<= 1) {
+            //for (; stride < loopLimit; stride <<= 1) {
                 localIdx = tid * stride + (stride - 1);
                 __syncthreads();
                 if (localIdx < loopLimit) {
@@ -508,7 +508,7 @@ namespace StreamCompaction {
             odata[indexBaseInBlock + localIdx] = s_odata[localIdx];
         }
 
-        __global__ void kernInclusiveScanWorkEfficientInBlockDownSweep(int n, int* odata, const int* idata) {
+        __global__ void kernInclusiveScanWorkEfficientInBlockDownSweep(int n, int* odata) {
             extern __shared__ int sharedMemory[];
             int bkDim = blockDim.x;
             int dblBkDim = blockDim.x << 1;
@@ -538,10 +538,19 @@ namespace StreamCompaction {
             __syncthreads();
 
 
-            unsigned int stride = 2;
-            for (; stride < loopLimit; stride <<= 1);
+            //unsigned int stride = 2;
+            //for (; stride < loopLimit; stride <<= 1);
             //stride >>= 1; // Because the rightmost sum is not calculated, we don't need to halve the stride
-            if (tid * stride + stride == loopLimit) {
+            unsigned int stride = loopLimit;
+
+            //int localIdxToWrite = localIdxToRead - 1;
+            //int localIdxToWrite2 = localIdxToRead2 - 1;
+            int reduction = 0; s_odata[loopLimit - 1];
+            __syncthreads();
+
+            //if (tid * stride + stride == loopLimit) {
+            if (localIdxToRead2 + 1 == loopLimit) {
+                reduction = s_odata[loopLimit - 1];
                 s_odata[loopLimit - 1] = 0;
             }
 
@@ -563,19 +572,21 @@ namespace StreamCompaction {
             //s_odata[localIdxToRead2] += s_idata[localIdxToRead2];
 
             // Write back
-            odata[indexBaseInBlock + localIdxToRead] = s_odata[localIdxToRead] + idata[indexBaseInBlock + localIdxToRead];
-            odata[indexBaseInBlock + localIdxToRead2] = s_odata[localIdxToRead2] + idata[indexBaseInBlock + localIdxToRead2];
+            int localIdxToWrite = localIdxToRead + 1;
+            int localIdxToWrite2 = localIdxToRead2 + 1;
+            int localIdxToWrite2IsLast = localIdxToWrite2 == loopLimit;
+            odata[indexBaseInBlock + localIdxToRead] = s_odata[localIdxToWrite];
+            odata[indexBaseInBlock + localIdxToRead2] = localIdxToWrite2IsLast * reduction + (1 - localIdxToWrite2IsLast) * s_odata[localIdxToWrite2];
         }
 
-        inline void inclusiveScanInBlockTwoPassPerBlock(int newN, int* cuda_g_odata, int* cuda_g_idata, int threadsPerBlock = 128, bool wrapPartition = false) {
+        inline void inclusiveScanInBlockTwoPassPerBlock(int newN, int* cuda_g_odata, int threadsPerBlock = 128, bool wrapPartition = false) {
             int blockCount = (newN + (threadsPerBlock - 1)) / threadsPerBlock;
             if (wrapPartition) {
                 //Wrap partition not implemented.
             }
             else {
-                cudaMemcpy(cuda_g_odata, cuda_g_idata, sizeof(int) * newN, cudaMemcpyDeviceToDevice);
                 kernInclusiveScanWorkEfficientInBlockUpSweep<<<blockCount, threadsPerBlock>> 1, (threadsPerBlock << 0) * sizeof(int)>>>(newN, cuda_g_odata);
-                kernInclusiveScanWorkEfficientInBlockDownSweep<<<blockCount, threadsPerBlock >> 1, (threadsPerBlock << 0) * sizeof(int)>>>(newN, cuda_g_odata, cuda_g_idata);
+                kernInclusiveScanWorkEfficientInBlockDownSweep<<<blockCount, threadsPerBlock >> 1, (threadsPerBlock << 0) * sizeof(int)>>>(newN, cuda_g_odata);
             }
         }
 
@@ -590,8 +601,7 @@ namespace StreamCompaction {
                     //    kernInclusiveScanSerialInBlock<<<serialBatch, threadsPerBlock>>>(newN, cuda_g_odata);
                     //}
                     //else {
-                    inclusiveScanInBlockTwoPassPerBlock(newN, cuda_g_blockIncrements, cuda_g_odata, threadsPerBlock);
-                    cudaMemcpy(cuda_g_odata, cuda_g_blockIncrements, sizeof(int) * newN, cudaMemcpyDeviceToDevice);
+                    inclusiveScanInBlockTwoPassPerBlock(newN, cuda_g_odata, threadsPerBlock);
                     //}
 
                     int nextNewN = batch;
@@ -612,9 +622,10 @@ namespace StreamCompaction {
                 }
                 else {
                     //inclusiveScanInBlock(newN, cuda_g_blockIncrements, threadsPerBlock); // Not correct if in depth > 0
-                    inclusiveScanInBlockTwoPassPerBlock(newN, cuda_g_blockIncrements, cuda_g_odata, threadsPerBlock);
+                    cudaMemcpy(cuda_g_blockIncrements, cuda_g_odata, sizeof(int) * (newN), cudaMemcpyDeviceToDevice);
 
-                    //cudaMemcpy(cuda_g_blockIncrements, cuda_g_odata, sizeof(int) * (newN), cudaMemcpyDeviceToDevice);
+                    inclusiveScanInBlockTwoPassPerBlock(newN, cuda_g_blockIncrements, threadsPerBlock);
+
                     cudaMemset(cuda_g_odata, 0, sizeof(int));
                     cudaMemcpy(cuda_g_odata + 1, cuda_g_blockIncrements, sizeof(int) * (newN - 1), cudaMemcpyDeviceToDevice);
                 }
